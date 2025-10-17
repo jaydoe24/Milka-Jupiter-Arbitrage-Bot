@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  jupiter-bot:
+    container_name: milka-jupiter-arbitrage-bot
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../config/.env
+    volumes:
+      - ../logs:/app/logs
+      - bot-data:/app/data
+    networks:
+      - bot-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 512m
+    cpus: 1.0
+
+networks:
+  bot-network:
+    driver: bridge
+
+volumes:
+  bot-data:
+    driver: local

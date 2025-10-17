@@ -1,44 +1,50 @@
-// This file contains the main bot code, including the logic for executing arbitrage strategies and managing the bot's lifecycle.
+// Main bot code for the Milka-Jupiter-Arbitrage-Bot
 
-import { ArbitrageStrategy } from './strategies/arbitrageStrategy';
-import { ExchangeConnector } from './connectors/exchangeConnector';
-import { loadConfig } from './config/default';
+// Import necessary libraries
+import { Client, GatewayIntentBits } from 'discord.js';
+import axios from 'axios';
 
-class MilkaJupiterArbitrageBot {
-    private strategy: ArbitrageStrategy;
-    private connector: ExchangeConnector;
-    private config: any;
+// Define the bot class
+class ArbitrageBot {
+    private client: Client;
 
     constructor() {
-        this.config = loadConfig();
-        this.connector = new ExchangeConnector(this.config);
-        this.strategy = new ArbitrageStrategy(this.connector);
+        this.client = new Client({ intents: [GatewayIntentBits.Guilds] });
+        this.initialize();
     }
 
-    public async start() {
-        console.log('Starting Milka Jupiter Arbitrage Bot...');
-        await this.connector.connect();
-        this.runArbitrage();
+    private initialize() {
+        this.client.once('ready', () => {
+            console.log(`Logged in as ${this.client.user?.tag}!`);
+            this.startMonitoring();
+        });
+
+        this.client.login(process.env.DISCORD_TOKEN);
     }
 
-    private async runArbitrage() {
+    private startMonitoring() {
+        // Logic to monitor markets and perform arbitrage
+        console.log('Monitoring markets for arbitrage opportunities...');
+        // Example: Fetch market data
+        this.fetchMarketData();
+    }
+
+    private async fetchMarketData() {
         try {
-            while (true) {
-                const opportunities = await this.strategy.findOpportunities();
-                if (opportunities.length > 0) {
-                    await this.strategy.executeOpportunities(opportunities);
-                }
-                await this.sleep(5000); // Wait for 5 seconds before checking again
-            }
+            const response = await axios.get('https://api.example.com/markets');
+            const marketData = response.data;
+            this.analyzeMarketData(marketData);
         } catch (error) {
-            console.error('Error in arbitrage execution:', error);
+            console.error('Error fetching market data:', error);
         }
     }
 
-    private sleep(ms: number) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+    private analyzeMarketData(data: any) {
+        // Analyze market data for arbitrage opportunities
+        console.log('Analyzing market data for arbitrage opportunities...');
+        // Implement analysis logic here
     }
 }
 
-const bot = new MilkaJupiterArbitrageBot();
-bot.start();
+// Instantiate and run the bot
+new ArbitrageBot();

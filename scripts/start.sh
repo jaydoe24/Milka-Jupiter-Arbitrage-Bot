@@ -1,15 +1,21 @@
 #!/bin/bash
 
-# Navigate to the project directory
-cd "$(dirname "$0")/.."
+echo "🚀 Starting Milka Jupiter Arbitrage Bot..."
 
-# Load environment variables from .env file
-if [ -f .env ]; then
-    export $(cat .env | xargs)
+# Check if .env exists
+if [ ! -f config/.env ]; then
+    echo "❌ config/.env not found!"
+    echo "   Run: ./scripts/setup.sh first"
+    exit 1
 fi
 
-# Start the TypeScript compiler in watch mode
-tsc -w &
+# Build and start Docker container
+cd "$(dirname "$0")/.." && docker-compose -f docker/docker-compose.yml up -d --build
 
-# Run the bot
-node dist/index.js
+echo ""
+echo "✅ Bot started successfully!"
+echo ""
+echo "View logs: ./scripts/logs.sh"
+echo "Check status: docker ps"
+echo "Stop bot: ./scripts/stop.sh"
+echo ""
