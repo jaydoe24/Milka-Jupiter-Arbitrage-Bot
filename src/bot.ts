@@ -1,4 +1,12 @@
-import { Connection, Keypair, VersionedTransaction, PublicKey, SystemProgram, TransactionMessage } from '@solana/web3.js';
+import {
+  Connection,
+  Keypair,
+  VersionedTransaction,
+  PublicKey,
+  SystemProgram,
+  TransactionMessage,
+  ComputeBudgetProgram,
+} from '@solana/web3.js';
 import { Wallet } from '@project-serum/anchor';
 import fetch from 'node-fetch';
 import bs58 from 'bs58';
@@ -6,607 +14,744 @@ import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
 
-// Load environment variables
 dotenv.config({ path: path.join(__dirname, '../config/.env') });
 
-/**
- * Production Solana MEV Arbitrage Bot
- * With Helius Sender Integration
- */
+// ─────────────────────────────────────────────
+//  CONSTANTS — from official Helius Sender docs
+//  https://www.helius.dev/docs/sending-transactions/sender
+// ─────────────────────────────────────────────
+
+// Official Helius Sender tip accounts (verified from docs + your dashboard screenshot)
+const HELIUS_TIP_ACCOUNTS = [
+  '4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE',
+  'D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ',
+  '9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta',
+  '5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn',
+  '2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD',
+  '2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ',
+  'wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF',
+  '3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT',
+  '4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey',
+  '4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or',
+];
+
+// Sender regional endpoints (use HTTP regional for VPS — lower latency than HTTPS global)
+const SENDER_ENDPOINTS: Record<string, string> = {
+  ewr:    'http://ewr-sender.helius-rpc.com/fast',  // Newark     — closest to US-East validators
+  slc:    'http://slc-sender.helius-rpc.com/fast',  // Salt Lake City
+  lon:    'http://lon-sender.helius-rpc.com/fast',  // London
+  fra:    'http://fra-sender.helius-rpc.com/fast',  // Frankfurt
+  ams:    'http://ams-sender.helius-rpc.com/fast',  // Amsterdam
+  sg:     'http://sg-sender.helius-rpc.com/fast',   // Singapore
+  tyo:    'http://tyo-sender.helius-rpc.com/fast',  // Tokyo
+  global: 'https://sender.helius-rpc.com/fast',     // Global HTTPS fallback
+};
+
+// Minimum tip per official docs: 0.0002 SOL = 200_000 lamports
+const MIN_TIP_LAMPORTS = 200_000;
+
+// ─────────────────────────────────────────────
+//  TYPES
+// ─────────────────────────────────────────────
 
 interface Config {
   rpcUrl: string;
   wsUrl: string;
   privateKey: string;
-  tradeAmount: number;
+  tradeAmountSol: number;
   minProfitPercent: number;
   maxPriceImpact: number;
   slippageBps: number;
-  enableLogging: boolean;
   logLevel: string;
-  senderMode: string;
-  senderTipLamports: number;
+  telegramToken: string;
+  telegramChatId: string;
+  isDevnet: boolean;
+  senderRegion: string;
+}
+
+interface TokenCandidate {
+  mint: string;
+  symbol: string;
+  volume24h: number;
 }
 
 interface ArbitrageOpportunity {
   tokenMint: string;
   tokenSymbol: string;
-  estimatedProfit: number;
-  profitPercent: number;
   buyQuote: any;
   sellQuote: any;
+  estimatedProfitSol: number;
+  profitPercent: number;
 }
 
 interface TradeStats {
   totalTrades: number;
   successfulTrades: number;
   failedTrades: number;
-  totalProfit: number;
-  totalLoss: number;
-  netProfit: number;
-  lastTradeTime: number;
+  simulationSkipped: number;
+  totalProfitSol: number;
+  totalLossSol: number;
+  netProfitSol: number;
+  startTime: number;
 }
+
+// ─────────────────────────────────────────────
+//  LOGGER
+// ─────────────────────────────────────────────
 
 class Logger {
-  private logLevel: string;
   private logDir: string;
+  private level: string;
 
-  constructor(logLevel: string = 'info', logDir: string = './logs') {
-    this.logLevel = logLevel;
+  constructor(level = 'info', logDir = './logs') {
+    this.level  = level;
     this.logDir = logDir;
-    
-    if (!fs.existsSync(logDir)) {
-      fs.mkdirSync(logDir, { recursive: true });
-    }
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
   }
 
-  private writeLog(level: string, message: string, data?: any) {
-    const timestamp = new Date().toISOString();
-    const logMessage = data 
-      ? `[${timestamp}] [${level}] ${message} ${JSON.stringify(data)}`
-      : `[${timestamp}] [${level}] ${message}`;
-    
-    const colors: any = {
-      info: '\x1b[36m',
-      success: '\x1b[32m',
-      warning: '\x1b[33m',
-      error: '\x1b[31m',
-      debug: '\x1b[90m'
+  private write(level: string, msg: string, data?: any) {
+    const ts   = new Date().toISOString();
+    const line = data
+      ? `[${ts}] [${level.toUpperCase()}] ${msg} | ${JSON.stringify(data)}`
+      : `[${ts}] [${level.toUpperCase()}] ${msg}`;
+    const colors: Record<string, string> = {
+      info: '\x1b[36m', success: '\x1b[32m',
+      warn: '\x1b[33m', error:   '\x1b[31m', debug: '\x1b[90m',
     };
-    
-    console.log(`${colors[level] || ''}${logMessage}\x1b[0m`);
-    
-    const logFile = path.join(this.logDir, `${level}.log`);
-    fs.appendFileSync(logFile, logMessage + '\n');
+    console.log(`${colors[level] ?? ''}${line}\x1b[0m`);
+    fs.appendFileSync(path.join(this.logDir, `${level}.log`), line + '\n');
   }
 
-  info(message: string, data?: any) { this.writeLog('info', message, data); }
-  success(message: string, data?: any) { this.writeLog('success', message, data); }
-  warning(message: string, data?: any) { this.writeLog('warning', message, data); }
-  error(message: string, data?: any) { this.writeLog('error', message, data); }
-  debug(message: string, data?: any) {
-    if (this.logLevel === 'debug') {
-      this.writeLog('debug', message, data);
-    }
-  }
+  info(msg: string, data?: any)    { this.write('info',    msg, data); }
+  success(msg: string, data?: any) { this.write('success', msg, data); }
+  warn(msg: string, data?: any)    { this.write('warn',    msg, data); }
+  error(msg: string, data?: any)   { this.write('error',   msg, data); }
+  debug(msg: string, data?: any)   { if (this.level === 'debug') this.write('debug', msg, data); }
 }
 
+// ─────────────────────────────────────────────
+//  PERFORMANCE TRACKER
+// ─────────────────────────────────────────────
+
 class PerformanceTracker {
-  private stats: TradeStats = {
-    totalTrades: 0,
-    successfulTrades: 0,
-    failedTrades: 0,
-    totalProfit: 0,
-    totalLoss: 0,
-    netProfit: 0,
-    lastTradeTime: 0
-  };
+  private stats: TradeStats;
+  private file: string;
+  private log: Logger;
 
-  private statsFile: string;
-  private logger: Logger;
-
-  constructor(logger: Logger, statsFile: string = './logs/stats.json') {
-    this.logger = logger;
-    this.statsFile = statsFile;
-    this.loadStats();
+  constructor(log: Logger, file = './logs/stats.json') {
+    this.log  = log;
+    this.file = file;
+    this.stats = this.load();
   }
 
-  private loadStats() {
+  private load(): TradeStats {
     try {
-      if (fs.existsSync(this.statsFile)) {
-        const data = fs.readFileSync(this.statsFile, 'utf8');
-        this.stats = JSON.parse(data);
-      }
-    } catch (error) {
-      this.logger.warning('Could not load stats, starting fresh');
-    }
+      if (fs.existsSync(this.file)) return JSON.parse(fs.readFileSync(this.file, 'utf8'));
+    } catch { /* fresh start */ }
+    return {
+      totalTrades: 0, successfulTrades: 0, failedTrades: 0,
+      simulationSkipped: 0, totalProfitSol: 0, totalLossSol: 0,
+      netProfitSol: 0, startTime: Date.now(),
+    };
   }
 
-  private saveStats() {
-    try {
-      fs.writeFileSync(this.statsFile, JSON.stringify(this.stats, null, 2));
-    } catch (error) {
-      this.logger.error('Failed to save stats', error);
-    }
+  private save() {
+    try { fs.writeFileSync(this.file, JSON.stringify(this.stats, null, 2)); } catch { /* ignore */ }
   }
 
-  recordTrade(success: boolean, profit: number) {
+  record(success: boolean, profitSol: number) {
     this.stats.totalTrades++;
-    this.stats.lastTradeTime = Date.now();
-    
     if (success) {
       this.stats.successfulTrades++;
-      if (profit > 0) {
-        this.stats.totalProfit += profit;
-      } else {
-        this.stats.totalLoss += Math.abs(profit);
-      }
+      profitSol > 0 ? (this.stats.totalProfitSol += profitSol) : (this.stats.totalLossSol += Math.abs(profitSol));
     } else {
       this.stats.failedTrades++;
     }
-    
-    this.stats.netProfit = this.stats.totalProfit - this.stats.totalLoss;
-    this.saveStats();
+    this.stats.netProfitSol = this.stats.totalProfitSol - this.stats.totalLossSol;
+    this.save();
   }
 
-  getStats(): TradeStats {
-    return { ...this.stats };
-  }
+  recordSimSkip() { this.stats.simulationSkipped++; this.save(); }
+  get(): TradeStats { return { ...this.stats }; }
 
-  printDailySummary() {
-    const successRate = this.stats.totalTrades > 0 
-      ? (this.stats.successfulTrades / this.stats.totalTrades * 100).toFixed(2)
-      : '0.00';
-    
-    this.logger.info('═══════════════════════════════════════════════════');
-    this.logger.info('                 DAILY SUMMARY                     ');
-    this.logger.info('═══════════════════════════════════════════════════');
-    this.logger.info(`Total Trades: ${this.stats.totalTrades}`);
-    this.logger.info(`Successful: ${this.stats.successfulTrades} | Failed: ${this.stats.failedTrades}`);
-    this.logger.info(`Success Rate: ${successRate}%`);
-    this.logger.info(`Total Profit: ${this.stats.totalProfit.toFixed(4)} SOL`);
-    this.logger.info(`Total Loss: ${this.stats.totalLoss.toFixed(4)} SOL`);
-    this.logger.info(`Net Profit: ${this.stats.netProfit.toFixed(4)} SOL`);
-    this.logger.info('═══════════════════════════════════════════════════');
+  summary() {
+    const s    = this.stats;
+    const rate = s.totalTrades > 0 ? ((s.successfulTrades / s.totalTrades) * 100).toFixed(1) : '0.0';
+    const upH  = ((Date.now() - s.startTime) / 3_600_000).toFixed(1);
+    this.log.info('═══════════════════ SUMMARY ═══════════════════');
+    this.log.info(`Uptime        : ${upH}h`);
+    this.log.info(`Total trades  : ${s.totalTrades}`);
+    this.log.info(`Success rate  : ${rate}%`);
+    this.log.info(`Sim skipped   : ${s.simulationSkipped}`);
+    this.log.info(`Profit        : +${s.totalProfitSol.toFixed(6)} SOL`);
+    this.log.info(`Loss          : -${s.totalLossSol.toFixed(6)} SOL`);
+    this.log.info(`Net           : ${s.netProfitSol.toFixed(6)} SOL`);
+    this.log.info('═══════════════════════════════════════════════');
   }
 }
 
-class JupiterArbitrageBotProduction {
-  private connection: Connection;
-  private wallet: Wallet;
-  private config: Config;
-  private logger: Logger;
-  private performanceTracker: PerformanceTracker;
-  
-  private wsol: string = 'So11111111111111111111111111111111111111112';
-  private isRunning: boolean = false;
-  private lastTradeTime: number = 0;
-  private minTimeBetweenTrades: number = 1000;
-  
-  // Circuit breaker
-  private consecutiveFailures: number = 0;
-  private maxConsecutiveFailures: number = 5;
-  private circuitBreakerTripped: boolean = false;
+// ─────────────────────────────────────────────
+//  TELEGRAM
+// ─────────────────────────────────────────────
 
-  // Helius Sender tip accounts
-  private tipAccounts: string[] = [
-    '4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE',
-    'D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ',
-    '9bnz4RShghqhAnLnzW862bkgBkgBgkEMcJNYrVAR4stB',
-    '5VV1ws6t6DiNz5FogJVV2BpqiNWZvpbPBSFNNacJJfUc',
-    '2nyhqdwcFK5JBVqQvXvL9JNqW2GNLvzJPkUBqiqgvqwK',
-    'wyvKWWYZP8KFqUTpYLgqBCT6Xvh8p6cWzHHMMMECvgD',
-    '3KKozDAaFaF4SJUE3jTg2zRG3n8J88ioQLy4JLw7zsVh',
-    '4vieeGHPYPG2MyupPRCjj4dummN3wmypPRCYj4i1DmmN',
-    '4TQkfNhMmAbsJfNLwrYdgcniBPJUWdWzFjLJUNQKecYr',
-    '3MWeKLHhPKvFcUPd77aHcoBXC71jfmQCzVDYzgD5K46y'
-  ];
+class Telegram {
+  private token: string;
+  private chatId: string;
+  private enabled: boolean;
 
-  constructor() {
-    this.config = this.loadConfig();
-    this.logger = new Logger(this.config.logLevel);
-    this.performanceTracker = new PerformanceTracker(this.logger);
-    
-    // Initialize Solana connection with Helius Sender endpoint
-    this.connection = new Connection(this.config.rpcUrl, {
-      commitment: 'confirmed',
-      wsEndpoint: this.config.wsUrl,
-      confirmTransactionInitialTimeout: 60000
-    });
-    
-    // Initialize wallet
-    const keypair = Keypair.fromSecretKey(bs58.decode(this.config.privateKey));
-    this.wallet = new Wallet(keypair);
-    
-    this.logger.info('═══════════════════════════════════════════════════');
-    this.logger.info('   Jupiter Arbitrage Bot - Production Mode');
-    this.logger.info('   With Helius Sender Integration');
-    this.logger.info('═══════════════════════════════════════════════════');
-    this.logger.info(`Wallet: ${this.wallet.publicKey.toBase58()}`);
-    this.logger.info(`RPC: ${this.config.rpcUrl.substring(0, 40)}...`);
-    this.logger.info(`Trade Amount: ${this.config.tradeAmount} SOL`);
-    this.logger.info(`Min Profit: ${this.config.minProfitPercent}%`);
-    this.logger.info(`Sender Mode: ${this.config.senderMode}`);
-    this.logger.info('═══════════════════════════════════════════════════');
+  constructor(token: string, chatId: string) {
+    this.token   = token;
+    this.chatId  = chatId;
+    this.enabled = !!(token && chatId && token !== 'disabled');
   }
 
-  private loadConfig(): Config {
-    const required = ['RPC_URL', 'PRIVATE_KEY'];
-    const missing = required.filter(key => !process.env[key]);
-    
-    if (missing.length > 0) {
-      throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
-    }
+  async send(msg: string) {
+    if (!this.enabled) return;
+    try {
+      await fetch(`https://api.telegram.org/bot${this.token}/sendMessage`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ chat_id: this.chatId, text: msg, parse_mode: 'HTML' }),
+      });
+    } catch { /* never crash bot on Telegram failure */ }
+  }
+}
 
+// ─────────────────────────────────────────────
+//  MAIN BOT
+// ─────────────────────────────────────────────
+
+class MilkaArbitrageBot {
+  private connection: Connection;
+  private wallet: Wallet;
+  private cfg: Config;
+  private log: Logger;
+  private tracker: PerformanceTracker;
+  private tg: Telegram;
+
+  private readonly WSOL          = 'So11111111111111111111111111111111111111112';
+  private readonly JUPITER_QUOTE = 'https://quote-api.jup.ag/v6/quote';
+  private readonly JUPITER_SWAP  = 'https://quote-api.jup.ag/v6/swap';
+
+  private isRunning           = false;
+  private consecutiveFailures = 0;
+  private readonly MAX_FAILURES = 5;
+
+  // Dynamic tip — fetched from Jito floor API, cached 5 min
+  private cachedTipLamports = MIN_TIP_LAMPORTS;
+  private tipCacheTime      = 0;
+
+  constructor() {
+    this.cfg     = this.loadConfig();
+    this.log     = new Logger(this.cfg.logLevel);
+    this.tracker = new PerformanceTracker(this.log);
+    this.tg      = new Telegram(this.cfg.telegramToken, this.cfg.telegramChatId);
+
+    this.connection = new Connection(this.cfg.rpcUrl, {
+      commitment: 'confirmed',
+      wsEndpoint: this.cfg.wsUrl,
+      confirmTransactionInitialTimeout: 60_000,
+    });
+
+    const keypair = Keypair.fromSecretKey(bs58.decode(this.cfg.privateKey));
+    this.wallet   = new Wallet(keypair);
+
+    const net = this.cfg.isDevnet ? '🔵 DEVNET' : '🔴 MAINNET';
+    this.log.info('═══════════════════════════════════════════════');
+    this.log.info(`  Milka Arbitrage Bot  ${net}`);
+    this.log.info(`  Sender: ${this.getSenderEndpoint()}`);
+    this.log.info('═══════════════════════════════════════════════');
+    this.log.info(`Wallet     : ${this.wallet.publicKey.toBase58()}`);
+    this.log.info(`Trade size : ${this.cfg.tradeAmountSol} SOL`);
+    this.log.info(`Min profit : ${this.cfg.minProfitPercent}%`);
+    this.log.info(`Telegram   : ${this.cfg.telegramToken !== 'disabled' ? 'ON' : 'OFF'}`);
+    this.log.info('═══════════════════════════════════════════════');
+  }
+
+  // ── CONFIG ──────────────────────────────────
+
+  private loadConfig(): Config {
+    const missing = ['RPC_URL', 'PRIVATE_KEY'].filter(k => !process.env[k]);
+    if (missing.length) throw new Error(`Missing env vars: ${missing.join(', ')}`);
     return {
-      rpcUrl: process.env.RPC_URL!,
-      wsUrl: process.env.WS_URL || process.env.RPC_URL!.replace('http', 'ws'),
-      privateKey: process.env.PRIVATE_KEY!,
-      tradeAmount: parseFloat(process.env.TRADE_AMOUNT || '0.05'),
+      rpcUrl:           process.env.RPC_URL!,
+      wsUrl:            process.env.WS_URL || process.env.RPC_URL!.replace('https', 'wss'),
+      privateKey:       process.env.PRIVATE_KEY!,
+      tradeAmountSol:   parseFloat(process.env.TRADE_AMOUNT       || '0.05'),
       minProfitPercent: parseFloat(process.env.MIN_PROFIT_PERCENT || '0.5'),
-      maxPriceImpact: parseFloat(process.env.MAX_PRICE_IMPACT || '1.0'),
-      slippageBps: parseInt(process.env.SLIPPAGE_BPS || '50'),
-      enableLogging: process.env.ENABLE_LOGGING !== 'false',
-      logLevel: process.env.LOG_LEVEL || 'info',
-      senderMode: process.env.SENDER_MODE || 'swqos_only',
-      senderTipLamports: parseInt(process.env.SENDER_TIP_LAMPORTS || '5000')
+      maxPriceImpact:   parseFloat(process.env.MAX_PRICE_IMPACT   || '1.0'),
+      slippageBps:      parseInt(  process.env.SLIPPAGE_BPS       || '50'),
+      logLevel:         process.env.LOG_LEVEL                     || 'info',
+      telegramToken:    process.env.TELEGRAM_BOT_TOKEN            || 'disabled',
+      telegramChatId:   process.env.TELEGRAM_CHAT_ID              || '',
+      isDevnet:         process.env.NETWORK                       === 'devnet',
+      senderRegion:     process.env.SENDER_REGION                 || 'ewr',
     };
   }
 
-  async start() {
-    this.logger.info('Starting arbitrage bot...');
-    
-    // Check wallet balance
-    const balance = await this.getBalance();
-    this.logger.info(`Wallet Balance: ${balance.toFixed(4)} SOL`);
-    
-    if (balance < this.config.tradeAmount * 2) {
-      this.logger.warning('Low balance! Recommended: 2x trade amount');
-    }
-    
-    this.isRunning = true;
-    
-    // Start monitoring loop
-    this.monitoringLoop();
-    
-    // Print daily summary every 24 hours
-    setInterval(() => {
-      this.performanceTracker.printDailySummary();
-    }, 24 * 60 * 60 * 1000);
-    
-    // Health check every 5 minutes
-    setInterval(() => {
-      this.healthCheck();
-    }, 5 * 60 * 1000);
+  private getSenderEndpoint(): string {
+    if (this.cfg.isDevnet) return this.cfg.rpcUrl; // Sender is mainnet-only
+    return SENDER_ENDPOINTS[this.cfg.senderRegion] ?? SENDER_ENDPOINTS.global;
   }
 
-  private async monitoringLoop() {
+  // ── START ────────────────────────────────────
+
+  async start() {
+    const balance = await this.getBalance();
+    this.log.info(`Balance: ${balance.toFixed(4)} SOL`);
+
+    if (balance < this.cfg.tradeAmountSol + 0.05) {
+      this.log.warn(`⚠️  Low balance. Recommended minimum: ${(this.cfg.tradeAmountSol + 0.05).toFixed(3)} SOL`);
+    }
+
+    await this.warmSenderConnection();
+
+    await this.tg.send(
+      `🤖 <b>Milka Bot Started</b>\n` +
+      `Network: ${this.cfg.isDevnet ? 'Devnet' : 'Mainnet'}\n` +
+      `Wallet: <code>${this.wallet.publicKey.toBase58()}</code>\n` +
+      `Balance: ${balance.toFixed(4)} SOL\n` +
+      `Sender: ${this.getSenderEndpoint()}`
+    );
+
+    this.isRunning = true;
+    setInterval(() => this.tracker.summary(),      60 * 60 * 1_000); // Hourly summary
+    setInterval(() => this.healthCheck(),           5  * 60 * 1_000); // Health check every 5 min
+    setInterval(() => this.warmSenderConnection(),  30 * 1_000);       // Keep Sender warm every 30s
+
+    await this.mainLoop();
+  }
+
+  stop() {
+    this.log.info('Shutting down...');
+    this.isRunning = false;
+    this.tracker.summary();
+    this.tg.send('🛑 <b>Milka Bot Stopped</b>');
+  }
+
+  // ── MAIN LOOP ────────────────────────────────
+
+  private async mainLoop() {
+    let circuitCooldown = false;
+
     while (this.isRunning) {
       try {
-        if (this.circuitBreakerTripped) {
-          this.logger.warning('Circuit breaker tripped. Waiting 60 seconds...');
-          await this.sleep(60000);
-          this.circuitBreakerTripped = false;
+        if (circuitCooldown) {
+          this.log.warn('Circuit breaker: cooling down 60s...');
+          await this.tg.send('⚠️ Circuit breaker tripped. Cooling 60s...');
+          await this.sleep(60_000);
+          circuitCooldown = false;
           this.consecutiveFailures = 0;
-          continue;
         }
-        
-        const tokens = await this.getTrendingTokens();
-        
+
+        const tokens = await this.getTokenCandidates();
+        this.log.debug(`Scanning ${tokens.length} tokens...`);
+
         for (const token of tokens) {
           if (!this.isRunning) break;
-          
-          try {
-            const opportunity = await this.checkArbitrageOpportunity(token);
-            
-            if (opportunity && opportunity.profitPercent >= this.config.minProfitPercent) {
-              if (Date.now() - this.lastTradeTime < this.minTimeBetweenTrades) {
-                continue;
-              }
-              
-              this.logger.info('🎯 OPPORTUNITY FOUND', {
-                token: opportunity.tokenSymbol,
-                profit: `${opportunity.estimatedProfit.toFixed(4)} SOL`,
-                percent: `${opportunity.profitPercent.toFixed(2)}%`
-              });
-              
-              await this.executeArbitrage(opportunity);
-              this.lastTradeTime = Date.now();
-            }
-          } catch (error) {
-            this.logger.debug(`Error checking ${token.symbol}`, error);
+          const opp = await this.findOpportunity(token);
+          if (!opp) continue;
+
+          this.log.info(`🎯 OPPORTUNITY: ${opp.tokenSymbol}`, {
+            profit: `${opp.estimatedProfitSol.toFixed(6)} SOL`,
+            pct:    `${opp.profitPercent.toFixed(2)}%`,
+          });
+
+          await this.execute(opp);
+          this.consecutiveFailures = 0;
+          await this.sleep(2_000);
+        }
+
+        await this.sleep(500);
+
+      } catch (err: any) {
+        this.log.error('Main loop error', err?.message);
+        this.consecutiveFailures++;
+        if (this.consecutiveFailures >= this.MAX_FAILURES) circuitCooldown = true;
+        await this.sleep(5_000);
+      }
+    }
+  }
+
+  // ── TOKEN CANDIDATES ─────────────────────────
+  // DexScreener first (volatile memecoins), Jupiter strict as fallback
+
+  private async getTokenCandidates(): Promise<TokenCandidate[]> {
+    const candidates: TokenCandidate[] = [];
+
+    try {
+      const res = await fetch(
+        'https://api.dexscreener.com/latest/dex/tokens/solana?limit=50',
+        { signal: AbortSignal.timeout(5_000) }
+      );
+      if (res.ok) {
+        const data: any = await res.json();
+        for (const p of (data?.pairs ?? []) as any[]) {
+          if (
+            p.chainId === 'solana' &&
+            p.volume?.h24   > 100_000 &&
+            p.liquidity?.usd > 20_000 &&
+            p.baseToken?.address !== this.WSOL
+          ) {
+            candidates.push({ mint: p.baseToken.address, symbol: p.baseToken.symbol ?? '???', volume24h: p.volume.h24 });
           }
         }
-        
-        await this.sleep(500);
-        
-      } catch (error) {
-        this.logger.error('Error in monitoring loop', error);
-        this.consecutiveFailures++;
-        
-        if (this.consecutiveFailures >= this.maxConsecutiveFailures) {
-          this.circuitBreakerTripped = true;
-          this.logger.error('🔴 CIRCUIT BREAKER TRIPPED - Too many failures');
+      }
+    } catch { this.log.debug('DexScreener failed, using fallback'); }
+
+    if (candidates.length === 0) {
+      try {
+        const res = await fetch('https://token.jup.ag/strict', { signal: AbortSignal.timeout(5_000) });
+        if (res.ok) {
+          const tokens: any[] = await res.json();
+          tokens
+            .filter((t: any) => t.daily_volume > 100_000 && t.address !== this.WSOL)
+            .sort((a: any, b: any) => b.daily_volume - a.daily_volume)
+            .slice(0, 40)
+            .forEach((t: any) => candidates.push({ mint: t.address, symbol: t.symbol, volume24h: t.daily_volume }));
         }
-        
-        await this.sleep(5000);
-      }
+      } catch { /* give up this cycle */ }
     }
+
+    const seen = new Set<string>();
+    return candidates
+      .filter(c => { if (seen.has(c.mint)) return false; seen.add(c.mint); return true; })
+      .slice(0, 40);
   }
 
-  private async getTrendingTokens(): Promise<Array<{mint: string, symbol: string}>> {
-    try {
-      const response = await fetch('https://token.jup.ag/strict');
-      const tokens = await response.json();
-      
-      const trending = tokens
-        .filter((t: any) => {
-          return t.daily_volume > 50000 &&
-                 !t.tags?.includes('unknown') &&
-                 t.symbol !== 'WSOL';
-        })
-        .slice(0, 30)
-        .map((t: any) => ({
-          mint: t.address,
-          symbol: t.symbol
-        }));
-      
-      return trending;
-    } catch (error) {
-      this.logger.error('Error fetching trending tokens', error);
-      return [];
-    }
-  }
+  // ── OPPORTUNITY DETECTION ────────────────────
 
-  private async checkArbitrageOpportunity(
-    token: {mint: string, symbol: string}
-  ): Promise<ArbitrageOpportunity | null> {
+  private async findOpportunity(token: TokenCandidate): Promise<ArbitrageOpportunity | null> {
     try {
-      const amountInLamports = Math.floor(this.config.tradeAmount * 1e9);
-      
-      const buyQuote = await this.getJupiterQuote(
-        this.wsol,
-        token.mint,
-        amountInLamports
-      );
-      
-      if (!buyQuote || buyQuote.priceImpactPct > this.config.maxPriceImpact) {
-        return null;
-      }
-      
-      const sellQuote = await this.getJupiterQuote(
-        token.mint,
-        this.wsol,
-        parseInt(buyQuote.outAmount)
-      );
-      
-      if (!sellQuote || sellQuote.priceImpactPct > this.config.maxPriceImpact) {
-        return null;
-      }
-      
-      const finalAmount = parseInt(sellQuote.outAmount) / 1e9;
-      const profit = finalAmount - this.config.tradeAmount;
-      const profitPercent = (profit / this.config.tradeAmount) * 100;
-      
-      // Account for fees + Sender tip
-      const txFees = 0.00002;
-      const senderTip = this.config.senderTipLamports / 1e9;
-      const netProfit = profit - txFees - (senderTip * 2); // 2 transactions
-      
-      if (netProfit > 0 && profitPercent >= this.config.minProfitPercent) {
-        return {
-          tokenMint: token.mint,
-          tokenSymbol: token.symbol,
-          estimatedProfit: netProfit,
-          profitPercent: profitPercent,
-          buyQuote: buyQuote,
-          sellQuote: sellQuote
-        };
-      }
-      
-      return null;
-    } catch (error) {
+      const inLamports = Math.floor(this.cfg.tradeAmountSol * 1e9);
+
+      // Quote A: WSOL → TOKEN
+      const buyUrl = new URL(this.JUPITER_QUOTE);
+      buyUrl.searchParams.set('inputMint',   this.WSOL);
+      buyUrl.searchParams.set('outputMint',  token.mint);
+      buyUrl.searchParams.set('amount',      inLamports.toString());
+      buyUrl.searchParams.set('slippageBps', this.cfg.slippageBps.toString());
+      buyUrl.searchParams.set('maxAccounts', '64');
+
+      const buyRes = await fetch(buyUrl.toString(), { signal: AbortSignal.timeout(3_000) });
+      if (!buyRes.ok) return null;
+      const buyQuote: any = await buyRes.json();
+      if (!buyQuote?.outAmount) return null;
+      if (parseFloat(buyQuote.priceImpactPct ?? '999') > this.cfg.maxPriceImpact) return null;
+
+      // Quote B: TOKEN → WSOL (exact out amount from A)
+      const sellUrl = new URL(this.JUPITER_QUOTE);
+      sellUrl.searchParams.set('inputMint',   token.mint);
+      sellUrl.searchParams.set('outputMint',  this.WSOL);
+      sellUrl.searchParams.set('amount',      buyQuote.outAmount);
+      sellUrl.searchParams.set('slippageBps', this.cfg.slippageBps.toString());
+      sellUrl.searchParams.set('maxAccounts', '64');
+
+      const sellRes = await fetch(sellUrl.toString(), { signal: AbortSignal.timeout(3_000) });
+      if (!sellRes.ok) return null;
+      const sellQuote: any = await sellRes.json();
+      if (!sellQuote?.outAmount) return null;
+      if (parseFloat(sellQuote.priceImpactPct ?? '999') > this.cfg.maxPriceImpact) return null;
+
+      const outLamports    = parseInt(sellQuote.outAmount);
+      const grossProfitSol = (outLamports - inLamports) / 1e9;
+
+      // Full fee model:
+      //   2× Helius Sender tip (one per tx), min 0.0002 SOL each
+      //   2× base tx fee (~0.000005 SOL each)
+      //   2× priority fee estimate (~0.0001 SOL each — Jupiter sets this dynamically)
+      const tipSol       = (await this.getDynamicTipLamports()) / 1e9;
+      const totalFees    = (tipSol * 2) + (0.000005 * 2) + (0.0001 * 2);
+      const netProfit    = grossProfitSol - totalFees;
+      const profitPct    = (netProfit / this.cfg.tradeAmountSol) * 100;
+
+      if (netProfit <= 0 || profitPct < this.cfg.minProfitPercent) return null;
+
+      return { tokenMint: token.mint, tokenSymbol: token.symbol, buyQuote, sellQuote, estimatedProfitSol: netProfit, profitPercent: profitPct };
+    } catch {
       return null;
     }
   }
 
-  private async getJupiterQuote(
-    inputMint: string,
-    outputMint: string,
-    amount: number
-  ): Promise<any> {
-    try {
-      const url = new URL('https://quote-api.jup.ag/v6/quote');
-      url.searchParams.append('inputMint', inputMint);
-      url.searchParams.append('outputMint', outputMint);
-      url.searchParams.append('amount', amount.toString());
-      url.searchParams.append('slippageBps', this.config.slippageBps.toString());
-      url.searchParams.append('onlyDirectRoutes', 'false');
-      url.searchParams.append('maxAccounts', '64');
-      
-      const response = await fetch(url.toString(), {
-        headers: { 'Accept': 'application/json' }
-      });
-      
-      if (!response.ok) return null;
-      
-      return await response.json();
-    } catch (error) {
-      return null;
-    }
-  }
+  // ── EXECUTE ──────────────────────────────────
 
-  private async executeArbitrage(opportunity: ArbitrageOpportunity) {
-    const startTime = Date.now();
-    
+  private async execute(opp: ArbitrageOpportunity) {
+    const t0 = Date.now();
     try {
-      this.logger.info('⚡ Executing arbitrage...', {
-        token: opportunity.tokenSymbol
-      });
-      
-      const buyTx = await this.executeSwap(opportunity.buyQuote);
-      
-      if (!buyTx) {
-        this.logger.error('Buy transaction failed');
-        this.performanceTracker.recordTrade(false, 0);
+      const [buyTx, sellTx] = await Promise.all([
+        this.buildSwapTx(opp.buyQuote),
+        this.buildSwapTx(opp.sellQuote),
+      ]);
+
+      if (!buyTx || !sellTx) {
+        this.log.warn(`${opp.tokenSymbol}: failed to build transactions`);
+        this.tracker.record(false, 0);
         return;
       }
-      
-      this.logger.success(`✅ Buy complete: ${buyTx.substring(0, 20)}...`);
-      
-      await this.sleep(1500);
-      
-      const sellTx = await this.executeSwap(opportunity.sellQuote);
-      
-      if (!sellTx) {
-        this.logger.error('⚠️  Sell transaction failed - holding token');
-        this.performanceTracker.recordTrade(false, 0);
+
+      // Simulate buy before spending fees
+      const simOk = await this.simulate(buyTx);
+      if (!simOk) {
+        this.log.debug(`${opp.tokenSymbol}: simulation rejected`);
+        this.tracker.recordSimSkip();
         return;
       }
-      
-      this.logger.success(`✅ Sell complete: ${sellTx.substring(0, 20)}...`);
-      
-      const executionTime = Date.now() - startTime;
-      this.logger.success(`💰 Arbitrage completed in ${executionTime}ms`, {
-        profit: `${opportunity.estimatedProfit.toFixed(4)} SOL`,
-        percent: `${opportunity.profitPercent.toFixed(2)}%`
-      });
-      
-      this.performanceTracker.recordTrade(true, opportunity.estimatedProfit);
-      this.consecutiveFailures = 0;
-      
-    } catch (error) {
-      this.logger.error('Execution error', error);
-      this.performanceTracker.recordTrade(false, 0);
+
+      // BUY via Helius Sender
+      const buySig = await this.sendViaSender(buyTx);
+      if (!buySig) {
+        this.log.warn(`${opp.tokenSymbol}: BUY tx failed`);
+        this.tracker.record(false, 0);
+        return;
+      }
+      this.log.success(`✅ BUY  : https://solscan.io/tx/${buySig}`);
+
+      await this.sleep(800); // Brief wait for buy to land
+
+      // SELL via Helius Sender
+      const sellSig = await this.sendViaSender(sellTx);
+      if (!sellSig) {
+        this.log.error(`⚠️  ${opp.tokenSymbol}: SELL FAILED — token stranded!`);
+        await this.tg.send(
+          `🚨 <b>SELL FAILED — ACTION NEEDED</b>\n` +
+          `Token: <b>${opp.tokenSymbol}</b>\n` +
+          `Mint: <code>${opp.tokenMint}</code>\n` +
+          `Buy tx: <a href="https://solscan.io/tx/${buySig}">view</a>\n` +
+          `👉 Manually sell on Jupiter: https://jup.ag/swap/${opp.tokenMint}-SOL`
+        );
+        this.tracker.record(false, 0);
+        return;
+      }
+
+      const ms = Date.now() - t0;
+      this.log.success(`✅ SELL : https://solscan.io/tx/${sellSig}`);
+      this.log.success(`💰 ${opp.estimatedProfitSol.toFixed(6)} SOL (${opp.profitPercent.toFixed(2)}%) in ${ms}ms`);
+
+      await this.tg.send(
+        `💰 <b>Profitable Trade!</b>\n` +
+        `Token: <b>${opp.tokenSymbol}</b>\n` +
+        `Profit: <b>${opp.estimatedProfitSol.toFixed(6)} SOL</b> (${opp.profitPercent.toFixed(2)}%)\n` +
+        `Time: ${ms}ms\n` +
+        `Buy: <a href="https://solscan.io/tx/${buySig}">view</a>  |  ` +
+        `Sell: <a href="https://solscan.io/tx/${sellSig}">view</a>`
+      );
+
+      this.tracker.record(true, opp.estimatedProfitSol);
+
+    } catch (err: any) {
+      this.log.error(`Execute error: ${opp.tokenSymbol}`, err?.message);
+      this.tracker.record(false, 0);
       this.consecutiveFailures++;
     }
   }
 
-  private async executeSwap(quote: any): Promise<string | null> {
+  // ── BUILD SWAP TX ────────────────────────────
+  // Jupiter builds the swap, we add:
+  //   1. Helius Sender tip instruction (mandatory, min 0.0002 SOL)
+  // Jupiter's `dynamicComputeUnitLimit` + `prioritizationFeeLamports: auto`
+  // handle ComputeBudget instructions automatically.
+
+  private async buildSwapTx(quote: any): Promise<VersionedTransaction | null> {
     try {
-      const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
-        method: 'POST',
+      const swapRes = await fetch(this.JUPITER_SWAP, {
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          quoteResponse: quote,
-          userPublicKey: this.wallet.publicKey.toBase58(),
-          wrapAndUnwrapSol: true,
-          dynamicComputeUnitLimit: true,
-          prioritizationFeeLamports: 'auto'
-        })
+        body:    JSON.stringify({
+          quoteResponse:             quote,
+          userPublicKey:             this.wallet.publicKey.toBase58(),
+          wrapAndUnwrapSol:          true,
+          dynamicComputeUnitLimit:   true,   // Jupiter auto-sets compute units
+          prioritizationFeeLamports: 'auto', // Jupiter auto-sets priority fee
+        }),
+        signal: AbortSignal.timeout(5_000),
       });
-      
-      const swapData = await swapResponse.json();
-      
-      if (!swapData.swapTransaction) {
-        throw new Error('No swap transaction');
-      }
-      
-      const swapTransactionBuf = Buffer.from(swapData.swapTransaction, 'base64');
-      let transaction = VersionedTransaction.deserialize(swapTransactionBuf);
-      
+
+      if (!swapRes.ok) return null;
+      const data: any = await swapRes.json();
+      if (!data?.swapTransaction) return null;
+
+      const txBuf = Buffer.from(data.swapTransaction, 'base64');
+      const tx    = VersionedTransaction.deserialize(txBuf);
+
       // Add Helius Sender tip instruction
-      transaction = await this.addSenderTip(transaction);
-      
-      transaction.sign([this.wallet.payer]);
-      
-      // Send via Helius Sender (skipPreflight MUST be true)
-      const signature = await this.connection.sendRawTransaction(
-        transaction.serialize(),
-        {
-          skipPreflight: true,  // Required for Sender!
-          maxRetries: 0
-        }
+      const tipLamports = await this.getDynamicTipLamports();
+      const tipAccount  = HELIUS_TIP_ACCOUNTS[
+        Math.floor(Math.random() * HELIUS_TIP_ACCOUNTS.length)
+      ];
+
+      const msg = TransactionMessage.decompile(tx.message);
+      msg.instructions.push(
+        SystemProgram.transfer({
+          fromPubkey: this.wallet.publicKey,
+          toPubkey:   new PublicKey(tipAccount),
+          lamports:   tipLamports,
+        })
       );
-      
-      const confirmation = await this.connection.confirmTransaction(
-        signature,
-        'confirmed'
-      );
-      
-      if (confirmation.value.err) {
-        throw new Error(`Transaction failed: ${confirmation.value.err}`);
-      }
-      
-      return signature;
-    } catch (error) {
-      this.logger.debug('Swap execution error', error);
+
+      return new VersionedTransaction(msg.compileToV0Message());
+
+    } catch (err: any) {
+      this.log.debug('buildSwapTx error', err?.message);
       return null;
     }
   }
 
-  private async addSenderTip(transaction: VersionedTransaction): Promise<VersionedTransaction> {
-    // Random tip account selection
-    const randomTipAccount = this.tipAccounts[Math.floor(Math.random() * this.tipAccounts.length)];
-    
-    const tipInstruction = SystemProgram.transfer({
-      fromPubkey: this.wallet.publicKey,
-      toPubkey: new PublicKey(randomTipAccount),
-      lamports: this.config.senderTipLamports
-    });
-    
-    // Rebuild transaction with tip
-    const message = TransactionMessage.decompile(transaction.message);
-    message.instructions.push(tipInstruction);
-    
-    const newMessage = message.compileToV0Message();
-    const newTransaction = new VersionedTransaction(newMessage);
-    
-    return newTransaction;
+  // ── SIMULATE ─────────────────────────────────
+
+  private async simulate(tx: VersionedTransaction): Promise<boolean> {
+    try {
+      const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
+      tx.message.recentBlockhash = blockhash;
+      const result = await this.connection.simulateTransaction(tx, {
+        commitment:             'processed',
+        replaceRecentBlockhash: true,
+      });
+      if (result.value.err) { this.log.debug('Simulation rejected', result.value.err); return false; }
+      return true;
+    } catch { return false; }
   }
 
+  // ── SEND VIA HELIUS SENDER ───────────────────
+  // Official requirements (from docs):
+  //   - POST to Sender endpoint (NOT standard RPC)
+  //   - skipPreflight: true  (MANDATORY)
+  //   - maxRetries: 0        (handle retries ourselves)
+  //   - Must include both tip + priority fee
+
+  private async sendViaSender(tx: VersionedTransaction): Promise<string | null> {
+    try {
+      const { blockhash, lastValidBlockHeight } =
+        await this.connection.getLatestBlockhash('confirmed');
+      tx.message.recentBlockhash = blockhash;
+      tx.sign([this.wallet.payer]);
+
+      const base64Tx = Buffer.from(tx.serialize()).toString('base64');
+      const endpoint = this.getSenderEndpoint();
+
+      const res = await fetch(endpoint, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          jsonrpc: '2.0',
+          id:      Date.now().toString(),
+          method:  'sendTransaction',
+          params:  [
+            base64Tx,
+            {
+              encoding:      'base64',
+              skipPreflight: true, // REQUIRED by Helius Sender
+              maxRetries:    0,    // We confirm manually below
+            },
+          ],
+        }),
+        signal: AbortSignal.timeout(8_000),
+      });
+
+      const json: any = await res.json();
+      if (json.error) { this.log.debug('Sender error', json.error); return null; }
+
+      const signature: string = json.result;
+      const confirmed = await this.confirmTx(signature, lastValidBlockHeight);
+      return confirmed ? signature : null;
+
+    } catch (err: any) {
+      this.log.debug('sendViaSender error', err?.message);
+      return null;
+    }
+  }
+
+  // ── CONFIRM ───────────────────────────────────
+
+  private async confirmTx(sig: string, lastValidBlockHeight: number): Promise<boolean> {
+    const timeout = 15_000;
+    const start   = Date.now();
+
+    while (Date.now() - start < timeout) {
+      try {
+        const height = await this.connection.getBlockHeight('confirmed');
+        if (height > lastValidBlockHeight) { this.log.debug(`Blockhash expired: ${sig.substring(0, 12)}...`); return false; }
+
+        const status = await this.connection.getSignatureStatuses([sig]);
+        const s      = status?.value?.[0];
+        if (s?.err) { this.log.debug('On-chain error', s.err); return false; }
+        if (s?.confirmationStatus === 'confirmed' || s?.confirmationStatus === 'finalized') return true;
+      } catch { /* retry */ }
+      await this.sleep(500);
+    }
+
+    this.log.debug(`Confirmation timeout: ${sig.substring(0, 12)}...`);
+    return false;
+  }
+
+  // ── DYNAMIC TIP ───────────────────────────────
+  // 75th percentile from Jito floor API, minimum 0.0002 SOL
+
+  private async getDynamicTipLamports(): Promise<number> {
+    const now = Date.now();
+    if (now - this.tipCacheTime < 5 * 60_000) return this.cachedTipLamports;
+
+    try {
+      const res = await fetch('https://bundles.jito.wtf/api/v1/bundles/tip_floor', {
+        signal: AbortSignal.timeout(3_000),
+      });
+      if (res.ok) {
+        const data: any = await res.json();
+        const tip75     = data?.[0]?.landed_tips_75th_percentile;
+        if (typeof tip75 === 'number') {
+          this.cachedTipLamports = Math.max(Math.ceil(tip75 * 1e9), MIN_TIP_LAMPORTS);
+          this.tipCacheTime      = now;
+          this.log.debug(`Dynamic tip: ${this.cachedTipLamports} lamports (${(this.cachedTipLamports / 1e9).toFixed(6)} SOL)`);
+        }
+      }
+    } catch { this.log.debug('Jito tip fetch failed, using cached'); }
+
+    return this.cachedTipLamports;
+  }
+
+  // ── CONNECTION WARMING ────────────────────────
+  // Per Helius docs: ping every 30s to keep connection warm
+
+  private async warmSenderConnection() {
+    if (this.cfg.isDevnet) return;
+    try {
+      const pingUrl = this.getSenderEndpoint().replace('/fast', '/ping');
+      await fetch(pingUrl, { signal: AbortSignal.timeout(2_000) });
+      this.log.debug('Sender connection warmed');
+    } catch { /* best-effort */ }
+  }
+
+  // ── HELPERS ───────────────────────────────────
+
   private async getBalance(): Promise<number> {
-    const balance = await this.connection.getBalance(this.wallet.publicKey);
-    return balance / 1e9;
+    return (await this.connection.getBalance(this.wallet.publicKey)) / 1e9;
   }
 
   private async healthCheck() {
     try {
-      const balance = await this.getBalance();
-      const stats = this.performanceTracker.getStats();
-      
-      this.logger.info('❤️  Health Check', {
-        balance: `${balance.toFixed(4)} SOL`,
-        trades: stats.totalTrades,
-        netProfit: `${stats.netProfit.toFixed(4)} SOL`,
-        isRunning: this.isRunning
+      const bal   = await this.getBalance();
+      const stats = this.tracker.get();
+      this.log.info('❤️  Health', {
+        balance:   `${bal.toFixed(4)} SOL`,
+        trades:    stats.totalTrades,
+        netProfit: `${stats.netProfitSol.toFixed(6)} SOL`,
+        failures:  this.consecutiveFailures,
       });
-    } catch (error) {
-      this.logger.error('Health check failed', error);
-    }
+      if (bal < 0.05) await this.tg.send(`⚠️ <b>LOW BALANCE</b>: ${bal.toFixed(4)} SOL — top up soon!`);
+    } catch { /* ignore */ }
   }
 
-  stop() {
-    this.logger.info('Stopping bot...');
-    this.isRunning = false;
-    this.performanceTracker.printDailySummary();
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
+  private sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 }
 
-// Main execution
+// ─────────────────────────────────────────────
+//  ENTRY POINT
+// ─────────────────────────────────────────────
+
 async function main() {
-  const bot = new JupiterArbitrageBotProduction();
-  
-  process.on('SIGINT', () => {
-    console.log('\n👋 Shutting down gracefully...');
-    bot.stop();
-    process.exit(0);
-  });
-  
-  process.on('SIGTERM', () => {
-    console.log('\n👋 Received SIGTERM, shutting down...');
-    bot.stop();
-    process.exit(0);
-  });
-  
+  const bot = new MilkaArbitrageBot();
+  process.on('SIGINT',  () => { bot.stop(); process.exit(0); });
+  process.on('SIGTERM', () => { bot.stop(); process.exit(0); });
   await bot.start();
 }
 
-main().catch(error => {
-  console.error('Fatal error:', error);
-  process.exit(1);
-});
+main().catch(err => { console.error('Fatal:', err); process.exit(1); });

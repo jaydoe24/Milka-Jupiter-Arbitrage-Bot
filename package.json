@@ -1,42 +1,32 @@
 {
   "name": "milka-jupiter-arbitrage-bot",
-  "version": "1.0.0",
-  "description": "Solana MEV Arbitrage Bot using Jupiter Aggregator",
+  "version": "2.0.0",
+  "description": "Solana Cross-DEX MEV Arbitrage Bot — Jupiter + Jito + DexScreener",
   "main": "dist/bot.js",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/bot.js",
-    "dev": "ts-node src/bot.ts",
-    "docker:build": "docker-compose build",
-    "docker:up": "docker-compose up -d",
-    "docker:down": "docker-compose down",
-    "docker:logs": "docker-compose logs -f",
-    "docker:restart": "docker-compose restart"
+    "build":          "tsc",
+    "start":          "node dist/bot.js",
+    "dev":            "ts-node src/bot.ts",
+    "docker:build":   "docker-compose -f docker/docker-compose.yml build",
+    "docker:up":      "docker-compose -f docker/docker-compose.yml up -d",
+    "docker:down":    "docker-compose -f docker/docker-compose.yml down",
+    "docker:logs":    "docker-compose -f docker/docker-compose.yml logs -f",
+    "docker:restart": "docker-compose -f docker/docker-compose.yml restart"
   },
-  "keywords": [
-    "solana",
-    "arbitrage",
-    "mev",
-    "jupiter",
-    "trading-bot",
-    "defi"
-  ],
-  "author": "jaydoe24",
-  "license": "MIT",
   "dependencies": {
-    "@solana/web3.js": "^1.87.6",
+    "@solana/web3.js":       "^1.87.6",
     "@project-serum/anchor": "^0.29.0",
-    "bs58": "^5.0.0",
-    "node-fetch": "^2.7.0",
-    "dotenv": "^16.3.1"
+    "bs58":                  "^5.0.0",
+    "node-fetch":            "^2.7.0",
+    "dotenv":                "^16.3.1"
   },
   "devDependencies": {
-    "@types/node": "^20.10.6",
-    "typescript": "^5.3.3",
-    "ts-node": "^10.9.2"
+    "@types/node":      "^20.10.6",
+    "@types/node-fetch": "^2.6.9",
+    "typescript":       "^5.3.3",
+    "ts-node":          "^10.9.2"
   },
   "engines": {
-    "node": ">=18.0.0",
-    "npm": ">=9.0.0"
+    "node": ">=18.0.0"
   }
 }
