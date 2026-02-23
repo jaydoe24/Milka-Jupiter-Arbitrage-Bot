@@ -10,6 +10,7 @@ services:
       - ../config/.env
     volumes:
       - ../logs:/app/logs
+      - ../watchlist.json:/app/watchlist.json
       - bot-data:/app/data
     networks:
       - bot-network
@@ -23,6 +24,32 @@ services:
         max-file: "3"
     mem_limit: 512m
     cpus: 1.0
+
+  graduation-watcher:
+    container_name: milka-graduation-watcher
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../config/.env
+    command: ["node", "dist/watcher.js"]
+    volumes:
+      - ../logs:/app/logs
+      - ../watchlist.json:/app/watchlist.json
+    networks:
+      - bot-network
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+    mem_limit: 256m
+    cpus: 0.5
+
 networks:
   bot-network:
     driver: bridge
