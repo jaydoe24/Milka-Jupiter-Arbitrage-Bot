@@ -1,5 +1,4 @@
 version: '3.8'
-
 services:
   jupiter-bot:
     container_name: milka-jupiter-arbitrage-bot
@@ -14,6 +13,9 @@ services:
       - bot-data:/app/data
     networks:
       - bot-network
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     logging:
       driver: "json-file"
       options:
@@ -21,11 +23,11 @@ services:
         max-file: "3"
     mem_limit: 512m
     cpus: 1.0
-
 networks:
   bot-network:
     driver: bridge
-
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "true"
 volumes:
   bot-data:
     driver: local
