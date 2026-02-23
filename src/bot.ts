@@ -452,10 +452,31 @@ class MilkaArbitrageBot {
       } catch { this.log.debug('DexScreener fetch failed for chunk'); }
     }
 
-    // Sort by volume descending, return top 40
+    // ── WATCHLIST ──────────────────────────────
+    // Reads watchlist.json from project root (hot-reload, no restart needed).
+    // Format: [{ "mint": "ADDRESS", "symbol": "NAME" }, ...]
+    // Watchlist tokens skip volume/liquidity filters — they are always scanned.
+
+    try {
+      const watchlistPath = path.join(__dirname, '../watchlist.json');
+      if (fs.existsSync(watchlistPath)) {
+        const raw: Array<{ mint: string; symbol: string }> =
+          JSON.parse(fs.readFileSync(watchlistPath, 'utf8'));
+        for (const entry of raw) {
+          if (!entry.mint || seen.has(entry.mint)) continue;
+          if (baseMints.includes(entry.mint)) continue;
+          seen.add(entry.mint);
+          candidates.push({ mint: entry.mint, symbol: entry.symbol ?? '???', volume24h: 0 });
+          this.log.debug(`Watchlist: ${entry.symbol} (${entry.mint.slice(0, 8)}...)`);
+        }
+      }
+    } catch { this.log.debug('watchlist.json read failed - skipping'); }
+
+    // Sort by volume descending (watchlist tokens have volume=0 so appear last),
+    // return top 60 to accommodate both seed + watchlist tokens.
     return candidates
       .sort((a, b) => b.volume24h - a.volume24h)
-      .slice(0, 40);
+      .slice(0, 60);
   }
 
   // ── OPPORTUNITY DETECTION ────────────────────
