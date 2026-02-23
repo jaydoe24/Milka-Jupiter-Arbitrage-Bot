@@ -6,9 +6,8 @@ import {
   SystemProgram,
   TransactionMessage,
   ComputeBudgetProgram,
-  AddressLookupTableAccount,
 } from '@solana/web3.js';
-import { Wallet } from '@project-serum/anchor';
+import { Wallet } from '@coral-xyz/anchor';
 import fetch from 'node-fetch';
 import bs58 from 'bs58';
 import * as dotenv from 'dotenv';
@@ -231,8 +230,20 @@ class MilkaArbitrageBot {
   private tg: Telegram;
 
   private readonly WSOL          = 'So11111111111111111111111111111111111111112';
-  private readonly JUPITER_QUOTE = 'https://quote-api.jup.ag/v6/quote';
-  private readonly JUPITER_SWAP  = 'https://quote-api.jup.ag/v6/swap';
+  private readonly USDC          = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+  private readonly USD1          = '83astBRguLjY6y8v5o3aryuPkAujEWL5zMBmXBRNkVAJ';
+  private readonly JUPITER_QUOTE = 'https://api.jup.ag/swap/v1/quote';
+  private readonly JUPITER_SWAP  = 'https://api.jup.ag/swap/v1/swap';
+  private readonly JUPITER_API_KEY = process.env.JUPITER_API_KEY || '';
+
+  // All base currencies the bot routes through
+  private get BASE_MINTS() {
+    return [
+      { mint: this.WSOL, symbol: 'WSOL', decimals: 9 },
+      { mint: this.USDC, symbol: 'USDC', decimals: 6 },
+      { mint: this.USD1, symbol: 'USD1', decimals: 6 },
+    ];
+  }
 
   private isRunning           = false;
   private consecutiveFailures = 0;
@@ -265,6 +276,7 @@ class MilkaArbitrageBot {
     this.log.info(`Wallet     : ${this.wallet.publicKey.toBase58()}`);
     this.log.info(`Trade size : ${this.cfg.tradeAmountSol} SOL`);
     this.log.info(`Min profit : ${this.cfg.minProfitPercent}%`);
+    this.log.info(`Bases      : WSOL, USDC, USD1`);
     this.log.info(`Telegram   : ${this.cfg.telegramToken !== 'disabled' ? 'ON' : 'OFF'}`);
     this.log.info('═══════════════════════════════════════════════');
   }
@@ -312,6 +324,7 @@ class MilkaArbitrageBot {
       `Network: ${this.cfg.isDevnet ? 'Devnet' : 'Mainnet'}\n` +
       `Wallet: <code>${this.wallet.publicKey.toBase58()}</code>\n` +
       `Balance: ${balance.toFixed(4)} SOL\n` +
+      `Bases: WSOL, USDC, USD1\n` +
       `Sender: ${this.getSenderEndpoint()}`
     );
 
@@ -346,7 +359,7 @@ class MilkaArbitrageBot {
         }
 
         const tokens = await this.getTokenCandidates();
-        this.log.debug(`Scanning ${tokens.length} tokens...`);
+        this.log.debug(`Scanning ${tokens.length} tokens × ${this.BASE_MINTS.length} bases...`);
 
         for (const token of tokens) {
           if (!this.isRunning) break;
@@ -375,103 +388,176 @@ class MilkaArbitrageBot {
   }
 
   // ── TOKEN CANDIDATES ─────────────────────────
-  // DexScreener first (volatile memecoins), Jupiter strict as fallback
+  // Fetches live volume/liquidity from DexScreener for a curated
+  // seed list of high-volume Solana tokens. Filters by min volume
+  // and liquidity, deduplicates, returns top 40.
 
   private async getTokenCandidates(): Promise<TokenCandidate[]> {
+    const baseMints = this.BASE_MINTS.map(b => b.mint);
+
+    // Curated seed list — top Solana tokens by consistent volume
+    const SEED_TOKENS = [
+      { mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', symbol: 'BONK'   },
+      { mint: 'EKpQGSJtjMFqKZ9KQanSqYXRYQAbKubwyIzACJgs5zU',  symbol: 'WIF'    },
+      { mint: 'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5',  symbol: 'MEW'    },
+      { mint: 'USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA',  symbol: 'USDS'   },
+      { mint: 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',  symbol: 'JUP'    },
+      { mint: 'orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE',  symbol: 'ORCA'   },
+      { mint: 'RLBxxFkseAZ4RgJH3Sqn8jXxhmGoz9jWxDNtXed4hmN',  symbol: 'RLB'    },
+      { mint: '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs',  symbol: 'ETH'    },
+      { mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',  symbol: 'USDT'   },
+      { mint: 'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',  symbol: 'mSOL'   },
+      { mint: 'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1',  symbol: 'bSOL'   },
+      { mint: 'HZ1JovNiVvGqszpscSdjH7LMHnqQyjr5miqBzuVQMHBH', symbol: 'PYTH'   },
+      { mint: 'jtojtomepa8bdph4n1qyplt5yx1kvZFvkKNzursvse',   symbol: 'JTO'    },
+      { mint: 'WENWENvqqNya429ubCdR81ZmD69brwQaaBYY6p3LCpk',  symbol: 'WEN'    },
+      { mint: 'nosXBVoaCTtYdLvKY6Csb4AC8JCdQKKAaWYtx2ZMoo7',  symbol: 'NOS'    },
+      { mint: 'TNSRxcUxoT9xBG3de7A4bBEkbdZtaQjhFLRLbSCxJQM',  symbol: 'TNSR'   },
+      { mint: 'BZLbGTNCSFfoth2GYDtwr7e4imWzpR5jqcUuGEwr646K',  symbol: 'IO'     },
+      { mint: 'GFX1ZjR2P15tmrSwow6FjyDYcEkoNAbSVmH7ULqdnhA2',  symbol: 'GFXP'   },
+      { mint: 'A9mUU4qviSctJVPJdBJWkb28deg915LYJKrzQ19ji3FM',  symbol: 'USDCet' },
+      { mint: '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo',  symbol: 'PYUSD'  },
+    ];
+
     const candidates: TokenCandidate[] = [];
+    const seen = new Set<string>();
 
-    try {
-      const res = await fetch(
-        'https://api.dexscreener.com/latest/dex/tokens/solana?limit=50',
-        { signal: AbortSignal.timeout(5_000) }
-      );
-      if (res.ok) {
-        const data: any = await res.json();
-        for (const p of (data?.pairs ?? []) as any[]) {
-          if (
-            p.chainId === 'solana' &&
-            p.volume?.h24   > 100_000 &&
-            p.liquidity?.usd > 20_000 &&
-            p.baseToken?.address !== this.WSOL
-          ) {
-            candidates.push({ mint: p.baseToken.address, symbol: p.baseToken.symbol ?? '???', volume24h: p.volume.h24 });
-          }
-        }
-      }
-    } catch { this.log.debug('DexScreener failed, using fallback'); }
+    // Batch fetch: DexScreener supports comma-separated addresses (up to 30)
+    const mints = SEED_TOKENS.map(t => t.mint);
+    const chunks: string[][] = [];
+    for (let i = 0; i < mints.length; i += 30) chunks.push(mints.slice(i, i + 30));
 
-    if (candidates.length === 0) {
+    for (const chunk of chunks) {
       try {
-        const res = await fetch('https://token.jup.ag/strict', { signal: AbortSignal.timeout(5_000) });
-        if (res.ok) {
-          const tokens: any[] = await res.json();
-          tokens
-            .filter((t: any) => t.daily_volume > 100_000 && t.address !== this.WSOL)
-            .sort((a: any, b: any) => b.daily_volume - a.daily_volume)
-            .slice(0, 40)
-            .forEach((t: any) => candidates.push({ mint: t.address, symbol: t.symbol, volume24h: t.daily_volume }));
+        const url = `https://api.dexscreener.com/latest/dex/tokens/${chunk.join(',')}`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(6_000) });
+        if (!res.ok) continue;
+        const data: any = await res.json();
+
+        for (const pair of (data?.pairs ?? []) as any[]) {
+          if (pair.chainId !== 'solana') continue;
+          if (baseMints.includes(pair.baseToken?.address)) continue;
+          if ((pair.volume?.h24  ?? 0) < 50_000) continue;
+          if ((pair.liquidity?.usd ?? 0) < 20_000) continue;
+
+          const mint = pair.baseToken?.address;
+          if (!mint || seen.has(mint)) continue;
+          seen.add(mint);
+
+          candidates.push({
+            mint,
+            symbol:    pair.baseToken?.symbol ?? '???',
+            volume24h: pair.volume?.h24 ?? 0,
+          });
         }
-      } catch { /* give up this cycle */ }
+      } catch { this.log.debug('DexScreener fetch failed for chunk'); }
     }
 
-    const seen = new Set<string>();
+    // ── WATCHLIST ──────────────────────────────
+    // Reads watchlist.json from project root (hot-reload, no restart needed).
+    // Format: [{ "mint": "ADDRESS", "symbol": "NAME" }, ...]
+    // Watchlist tokens skip volume/liquidity filters — they are always scanned.
+
+    try {
+      const watchlistPath = path.join(__dirname, '../watchlist.json');
+      if (fs.existsSync(watchlistPath)) {
+        const raw: Array<{ mint: string; symbol: string }> =
+          JSON.parse(fs.readFileSync(watchlistPath, 'utf8'));
+        for (const entry of raw) {
+          if (!entry.mint || seen.has(entry.mint)) continue;
+          if (baseMints.includes(entry.mint)) continue;
+          seen.add(entry.mint);
+          candidates.push({ mint: entry.mint, symbol: entry.symbol ?? '???', volume24h: 0 });
+          this.log.debug(`Watchlist: ${entry.symbol} (${entry.mint.slice(0, 8)}...)`);
+        }
+      }
+    } catch { this.log.debug('watchlist.json read failed - skipping'); }
+
+    // Sort by volume descending (watchlist tokens have volume=0 so appear last),
+    // return top 60 to accommodate both seed + watchlist tokens.
     return candidates
-      .filter(c => { if (seen.has(c.mint)) return false; seen.add(c.mint); return true; })
-      .slice(0, 40);
+      .sort((a, b) => b.volume24h - a.volume24h)
+      .slice(0, 60);
   }
 
   // ── OPPORTUNITY DETECTION ────────────────────
+  // Tries WSOL, USDC, and USD1 as base currencies.
+  // Returns the most profitable route found, or null.
 
   private async findOpportunity(token: TokenCandidate): Promise<ArbitrageOpportunity | null> {
-    try {
-      const inLamports = Math.floor(this.cfg.tradeAmountSol * 1e9);
+    // Conservative SOL price approximation for normalising stablecoin profits to SOL
+    const SOL_USD_APPROX = 150;
+    let best: ArbitrageOpportunity | null = null;
 
-      // Quote A: WSOL → TOKEN
-      const buyUrl = new URL(this.JUPITER_QUOTE);
-      buyUrl.searchParams.set('inputMint',   this.WSOL);
-      buyUrl.searchParams.set('outputMint',  token.mint);
-      buyUrl.searchParams.set('amount',      inLamports.toString());
-      buyUrl.searchParams.set('slippageBps', this.cfg.slippageBps.toString());
-      buyUrl.searchParams.set('maxAccounts', '64');
+    for (const base of this.BASE_MINTS) {
+      try {
+        // Amount in base currency atomic units
+        const inAmount = base.mint === this.WSOL
+          ? Math.floor(this.cfg.tradeAmountSol * 1e9)
+          : Math.floor(this.cfg.tradeAmountSol * SOL_USD_APPROX * Math.pow(10, base.decimals));
 
-      const buyRes = await fetch(buyUrl.toString(), { signal: AbortSignal.timeout(3_000) });
-      if (!buyRes.ok) return null;
-      const buyQuote: any = await buyRes.json();
-      if (!buyQuote?.outAmount) return null;
-      if (parseFloat(buyQuote.priceImpactPct ?? '999') > this.cfg.maxPriceImpact) return null;
+        // Quote A: BASE → TOKEN
+        const buyUrl = new URL(this.JUPITER_QUOTE);
+        buyUrl.searchParams.set('inputMint',   base.mint);
+        buyUrl.searchParams.set('outputMint',  token.mint);
+        buyUrl.searchParams.set('amount',      inAmount.toString());
+        buyUrl.searchParams.set('slippageBps', this.cfg.slippageBps.toString());
+        buyUrl.searchParams.set('maxAccounts', '64');
 
-      // Quote B: TOKEN → WSOL (exact out amount from A)
-      const sellUrl = new URL(this.JUPITER_QUOTE);
-      sellUrl.searchParams.set('inputMint',   token.mint);
-      sellUrl.searchParams.set('outputMint',  this.WSOL);
-      sellUrl.searchParams.set('amount',      buyQuote.outAmount);
-      sellUrl.searchParams.set('slippageBps', this.cfg.slippageBps.toString());
-      sellUrl.searchParams.set('maxAccounts', '64');
+        const buyRes = await fetch(buyUrl.toString(), { signal: AbortSignal.timeout(3_000), headers: { 'x-api-key': this.JUPITER_API_KEY } });
+        if (!buyRes.ok) continue;
+        const buyQuote: any = await buyRes.json();
+        if (!buyQuote?.outAmount) continue;
+        if (parseFloat(buyQuote.priceImpactPct ?? '999') > this.cfg.maxPriceImpact) continue;
 
-      const sellRes = await fetch(sellUrl.toString(), { signal: AbortSignal.timeout(3_000) });
-      if (!sellRes.ok) return null;
-      const sellQuote: any = await sellRes.json();
-      if (!sellQuote?.outAmount) return null;
-      if (parseFloat(sellQuote.priceImpactPct ?? '999') > this.cfg.maxPriceImpact) return null;
+        // Quote B: TOKEN → BASE (round trip)
+        const sellUrl = new URL(this.JUPITER_QUOTE);
+        sellUrl.searchParams.set('inputMint',   token.mint);
+        sellUrl.searchParams.set('outputMint',  base.mint);
+        sellUrl.searchParams.set('amount',      buyQuote.outAmount);
+        sellUrl.searchParams.set('slippageBps', this.cfg.slippageBps.toString());
+        sellUrl.searchParams.set('maxAccounts', '64');
 
-      const outLamports    = parseInt(sellQuote.outAmount);
-      const grossProfitSol = (outLamports - inLamports) / 1e9;
+        const sellRes = await fetch(sellUrl.toString(), { signal: AbortSignal.timeout(3_000), headers: { 'x-api-key': this.JUPITER_API_KEY } });
+        if (!sellRes.ok) continue;
+        const sellQuote: any = await sellRes.json();
+        if (!sellQuote?.outAmount) continue;
+        if (parseFloat(sellQuote.priceImpactPct ?? '999') > this.cfg.maxPriceImpact) continue;
 
-      // Full fee model:
-      //   2× Helius Sender tip (one per tx), min 0.0002 SOL each
-      //   2× base tx fee (~0.000005 SOL each)
-      //   2× priority fee estimate (~0.0001 SOL each — Jupiter sets this dynamically)
-      const tipSol       = (await this.getDynamicTipLamports()) / 1e9;
-      const totalFees    = (tipSol * 2) + (0.000005 * 2) + (0.0001 * 2);
-      const netProfit    = grossProfitSol - totalFees;
-      const profitPct    = (netProfit / this.cfg.tradeAmountSol) * 100;
+        const outAmount         = parseInt(sellQuote.outAmount);
+        const grossProfitInBase = outAmount - inAmount;
 
-      if (netProfit <= 0 || profitPct < this.cfg.minProfitPercent) return null;
+        // Normalise to SOL for fee comparison
+        const grossProfitSol = base.mint === this.WSOL
+          ? grossProfitInBase / 1e9
+          : (grossProfitInBase / Math.pow(10, base.decimals)) / SOL_USD_APPROX;
 
-      return { tokenMint: token.mint, tokenSymbol: token.symbol, buyQuote, sellQuote, estimatedProfitSol: netProfit, profitPercent: profitPct };
-    } catch {
-      return null;
+        // Full fee model:
+        //   2× Helius Sender tip (one per tx), min 0.0002 SOL each
+        //   2× base tx fee (~0.000005 SOL each)
+        //   2× priority fee estimate (~0.0001 SOL each — Jupiter sets dynamically)
+        const tipSol    = (await this.getDynamicTipLamports()) / 1e9;
+        const totalFees = (tipSol * 2) + (0.000005 * 2) + (0.0001 * 2);
+        const netProfit = grossProfitSol - totalFees;
+        const profitPct = (netProfit / this.cfg.tradeAmountSol) * 100;
+
+        if (netProfit <= 0 || profitPct < this.cfg.minProfitPercent) continue;
+
+        // Keep only the best route across all bases
+        if (!best || netProfit > best.estimatedProfitSol) {
+          best = {
+            tokenMint:          token.mint,
+            tokenSymbol:        `${base.symbol}→${token.symbol}→${base.symbol}`,
+            buyQuote,
+            sellQuote,
+            estimatedProfitSol: netProfit,
+            profitPercent:      profitPct,
+          };
+        }
+      } catch { continue; }
     }
+
+    return best;
   }
 
   // ── EXECUTE ──────────────────────────────────
@@ -530,7 +616,7 @@ class MilkaArbitrageBot {
 
       await this.tg.send(
         `💰 <b>Profitable Trade!</b>\n` +
-        `Token: <b>${opp.tokenSymbol}</b>\n` +
+        `Route: <b>${opp.tokenSymbol}</b>\n` +
         `Profit: <b>${opp.estimatedProfitSol.toFixed(6)} SOL</b> (${opp.profitPercent.toFixed(2)}%)\n` +
         `Time: ${ms}ms\n` +
         `Buy: <a href="https://solscan.io/tx/${buySig}">view</a>  |  ` +
@@ -556,7 +642,7 @@ class MilkaArbitrageBot {
     try {
       const swapRes = await fetch(this.JUPITER_SWAP, {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-api-key': this.JUPITER_API_KEY },
         body:    JSON.stringify({
           quoteResponse:             quote,
           userPublicKey:             this.wallet.publicKey.toBase58(),
@@ -574,26 +660,13 @@ class MilkaArbitrageBot {
       const txBuf = Buffer.from(data.swapTransaction, 'base64');
       const tx    = VersionedTransaction.deserialize(txBuf);
 
-      // ── Fetch Address Lookup Tables (ALTs) ──────────────────────────
-      // Jupiter v1 uses ALTs to compress transactions. We MUST fetch and
-      // pass them when decompiling/recompiling, otherwise all compressed
-      // addresses expand to full pubkeys and the tx exceeds the 1232-byte
-      // size limit, causing every trade to fail silently.
-      const altKeys    = tx.message.addressTableLookups.map(a => a.accountKey);
-      const altResults = await Promise.all(
-        altKeys.map(key => this.connection.getAddressLookupTable(key).then(r => r.value))
-      );
-      const validAlts  = altResults.filter(Boolean) as AddressLookupTableAccount[];
-
       // Add Helius Sender tip instruction
       const tipLamports = await this.getDynamicTipLamports();
       const tipAccount  = HELIUS_TIP_ACCOUNTS[
         Math.floor(Math.random() * HELIUS_TIP_ACCOUNTS.length)
       ];
 
-      const msg = TransactionMessage.decompile(tx.message, {
-        addressLookupTableAccounts: validAlts,
-      });
+      const msg = TransactionMessage.decompile(tx.message);
       msg.instructions.push(
         SystemProgram.transfer({
           fromPubkey: this.wallet.publicKey,
@@ -602,7 +675,7 @@ class MilkaArbitrageBot {
         })
       );
 
-      return new VersionedTransaction(msg.compileToV0Message(validAlts));
+      return new VersionedTransaction(msg.compileToV0Message());
 
     } catch (err: any) {
       this.log.debug('buildSwapTx error', err?.message);
