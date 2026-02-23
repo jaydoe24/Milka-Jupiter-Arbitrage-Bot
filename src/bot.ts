@@ -232,8 +232,9 @@ class MilkaArbitrageBot {
   private readonly WSOL          = 'So11111111111111111111111111111111111111112';
   private readonly USDC          = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
   private readonly USD1          = '83astBRguLjY6y8v5o3aryuPkAujEWL5zMBmXBRNkVAJ';
-  private readonly JUPITER_QUOTE = 'https://quote-api.jup.ag/v6/quote';
-  private readonly JUPITER_SWAP  = 'https://quote-api.jup.ag/v6/swap';
+  private readonly JUPITER_QUOTE = 'https://api.jup.ag/swap/v1/quote';
+  private readonly JUPITER_SWAP  = 'https://api.jup.ag/swap/v1/swap';
+  private readonly JUPITER_API_KEY = process.env.JUPITER_API_KEY || '';
 
   // All base currencies the bot routes through
   private get BASE_MINTS() {
@@ -503,7 +504,7 @@ class MilkaArbitrageBot {
         buyUrl.searchParams.set('slippageBps', this.cfg.slippageBps.toString());
         buyUrl.searchParams.set('maxAccounts', '64');
 
-        const buyRes = await fetch(buyUrl.toString(), { signal: AbortSignal.timeout(3_000) });
+        const buyRes = await fetch(buyUrl.toString(), { signal: AbortSignal.timeout(3_000), headers: { 'x-api-key': this.JUPITER_API_KEY } });
         if (!buyRes.ok) continue;
         const buyQuote: any = await buyRes.json();
         if (!buyQuote?.outAmount) continue;
@@ -517,7 +518,7 @@ class MilkaArbitrageBot {
         sellUrl.searchParams.set('slippageBps', this.cfg.slippageBps.toString());
         sellUrl.searchParams.set('maxAccounts', '64');
 
-        const sellRes = await fetch(sellUrl.toString(), { signal: AbortSignal.timeout(3_000) });
+        const sellRes = await fetch(sellUrl.toString(), { signal: AbortSignal.timeout(3_000), headers: { 'x-api-key': this.JUPITER_API_KEY } });
         if (!sellRes.ok) continue;
         const sellQuote: any = await sellRes.json();
         if (!sellQuote?.outAmount) continue;
@@ -641,7 +642,7 @@ class MilkaArbitrageBot {
     try {
       const swapRes = await fetch(this.JUPITER_SWAP, {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-api-key': this.JUPITER_API_KEY },
         body:    JSON.stringify({
           quoteResponse:             quote,
           userPublicKey:             this.wallet.publicKey.toBase58(),
