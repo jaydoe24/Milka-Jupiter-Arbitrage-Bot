@@ -8,7 +8,7 @@ import {
   ComputeBudgetProgram,
   AddressLookupTableAccount,
 } from '@solana/web3.js';
-import { Wallet } from '@project-serum/anchor';
+import { Wallet } from '@coral-xyz/anchor';
 import fetch from 'node-fetch';
 import bs58 from 'bs58';
 import * as dotenv from 'dotenv';
@@ -231,8 +231,12 @@ class MilkaArbitrageBot {
   private tg: Telegram;
 
   private readonly WSOL          = 'So11111111111111111111111111111111111111112';
-  private readonly JUPITER_QUOTE = 'https://quote-api.jup.ag/v6/quote';
-  private readonly JUPITER_SWAP  = 'https://quote-api.jup.ag/v6/swap';
+  private geckoCache:   { tokens: TokenCandidate[]; ts: number } = { tokens: [], ts: 0 };
+  private moralisCache: { tokens: TokenCandidate[]; ts: number } = { tokens: [], ts: 0 };
+  private moralisKeyIdx = 0;
+  private readonly GECKO_TTL = 5 * 60 * 1000; // 5 minutes
+  private readonly JUPITER_QUOTE = 'https://lite-api.jup.ag/swap/v1/quote';
+  private readonly JUPITER_SWAP  = 'https://lite-api.jup.ag/swap/v1/swap';
 
   private isRunning           = false;
   private consecutiveFailures = 0;
@@ -351,6 +355,7 @@ class MilkaArbitrageBot {
         for (const token of tokens) {
           if (!this.isRunning) break;
           const opp = await this.findOpportunity(token);
+          await this.sleep(1_500);
           if (!opp) continue;
 
           this.log.info(`🎯 OPPORTUNITY: ${opp.tokenSymbol}`, {
@@ -363,7 +368,7 @@ class MilkaArbitrageBot {
           await this.sleep(2_000);
         }
 
-        await this.sleep(500);
+        await this.sleep(1500);
 
       } catch (err: any) {
         this.log.error('Main loop error', err?.message);
@@ -380,44 +385,81 @@ class MilkaArbitrageBot {
   private async getTokenCandidates(): Promise<TokenCandidate[]> {
     const candidates: TokenCandidate[] = [];
 
-    try {
-      const res = await fetch(
-        'https://api.dexscreener.com/latest/dex/tokens/solana?limit=50',
-        { signal: AbortSignal.timeout(5_000) }
-      );
-      if (res.ok) {
+    // 1. GeckoTerminal trending Solana pools (cached 5min to avoid rate limits)
+    const now = Date.now();
+    if (now - this.geckoCache.ts > this.GECKO_TTL || this.geckoCache.tokens.length === 0) {
+      try {
+        const res = await fetch('https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1', {
+          signal: AbortSignal.timeout(5_000)
+        });
         const data: any = await res.json();
-        for (const p of (data?.pairs ?? []) as any[]) {
-          if (
-            p.chainId === 'solana' &&
-            p.volume?.h24   > 100_000 &&
-            p.liquidity?.usd > 20_000 &&
-            p.baseToken?.address !== this.WSOL
-          ) {
-            candidates.push({ mint: p.baseToken.address, symbol: p.baseToken.symbol ?? '???', volume24h: p.volume.h24 });
+        const fresh: TokenCandidate[] = [];
+        for (const pool of (data.data || []).slice(0, 30)) {
+          const baseId = pool.relationships?.base_token?.data?.id || '';
+          const mint = baseId.replace('solana_', '');
+          const name = pool.attributes?.name?.split(' /')[0] || '???';
+          const vol = parseFloat(pool.attributes?.volume_usd?.h24 || '0');
+          if (mint && vol > 50_000) fresh.push({ mint, symbol: name, volume24h: vol });
+        }
+        if (fresh.length > 0) {
+          this.geckoCache = { tokens: fresh, ts: now };
+          this.log.debug(`GeckoTerminal: refreshed ${fresh.length} trending tokens`);
+        }
+      } catch (e: any) {
+        this.log.debug('GeckoTerminal fetch failed:', e?.message);
+      }
+    }
+    candidates.push(...this.geckoCache.tokens);
+
+    // 2. Moralis pump.fun graduated tokens (cached 10min, key rotation)
+    if (now - this.moralisCache.ts > 10 * 60 * 1000 || this.moralisCache.tokens.length === 0) {
+      const keys = [
+        process.env.MORALIS_API_KEY  || '',
+        process.env.MORALIS_API_KEY_2 || '',
+      ].filter(Boolean);
+      if (keys.length > 0) {
+        const key = keys[this.moralisKeyIdx % keys.length];
+        this.moralisKeyIdx++;
+        try {
+          const res = await fetch(
+            'https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/graduated?limit=50',
+            { headers: { 'X-API-Key': key, 'accept': 'application/json' }, signal: AbortSignal.timeout(5_000) }
+          );
+          const data: any = await res.json();
+          const fresh: TokenCandidate[] = [];
+          for (const t of (data.result || [])) {
+            const mint = t.tokenAddress;
+            const symbol = t.symbol || mint.slice(0, 8);
+            const liq = parseFloat(t.liquidity || '0');
+            if (mint && liq > 5_000) fresh.push({ mint, symbol, volume24h: liq });
           }
+          if (fresh.length > 0) {
+            this.moralisCache = { tokens: fresh, ts: now };
+            this.log.debug(`Moralis: refreshed ${fresh.length} graduated tokens`);
+          }
+        } catch (e: any) {
+          this.log.debug('Moralis fetch failed:', e?.message);
         }
       }
-    } catch { this.log.debug('DexScreener failed, using fallback'); }
-
-    if (candidates.length === 0) {
-      try {
-        const res = await fetch('https://token.jup.ag/strict', { signal: AbortSignal.timeout(5_000) });
-        if (res.ok) {
-          const tokens: any[] = await res.json();
-          tokens
-            .filter((t: any) => t.daily_volume > 100_000 && t.address !== this.WSOL)
-            .sort((a: any, b: any) => b.daily_volume - a.daily_volume)
-            .slice(0, 40)
-            .forEach((t: any) => candidates.push({ mint: t.address, symbol: t.symbol, volume24h: t.daily_volume }));
-        }
-      } catch { /* give up this cycle */ }
     }
+    candidates.push(...this.moralisCache.tokens);
+
+    // 3. Recent watchlist graduates (last 2h — tightest arb window)
+    try {
+      const fs = await import('fs');
+      const wl = JSON.parse(fs.readFileSync('/app/watchlist.json', 'utf8')) as any[];
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      for (const t of wl) {
+        if (new Date(t.graduatedAt).getTime() > cutoff) {
+          candidates.push({ mint: t.mint, symbol: t.symbol, volume24h: 500_000 });
+        }
+      }
+    } catch { /* no watchlist yet */ }
 
     const seen = new Set<string>();
     return candidates
       .filter(c => { if (seen.has(c.mint)) return false; seen.add(c.mint); return true; })
-      .slice(0, 40);
+      .slice(0, 50);
   }
 
   // ── OPPORTUNITY DETECTION ────────────────────
@@ -466,7 +508,7 @@ class MilkaArbitrageBot {
       const netProfit    = grossProfitSol - totalFees;
       const profitPct    = (netProfit / this.cfg.tradeAmountSol) * 100;
 
-      if (netProfit <= 0 || profitPct < this.cfg.minProfitPercent) return null;
+      if (netProfit <= 0 || profitPct < this.cfg.minProfitPercent || profitPct > 20) return null;
 
       return { tokenMint: token.mint, tokenSymbol: token.symbol, buyQuote, sellQuote, estimatedProfitSol: netProfit, profitPercent: profitPct };
     } catch {
@@ -484,6 +526,7 @@ class MilkaArbitrageBot {
         this.buildSwapTx(opp.sellQuote),
       ]);
 
+      this.log.debug(`buildSwapTx results: buyTx=${!!buyTx} sellTx=${!!sellTx}`);
       if (!buyTx || !sellTx) {
         this.log.warn(`${opp.tokenSymbol}: failed to build transactions`);
         this.tracker.record(false, 0);
@@ -494,6 +537,14 @@ class MilkaArbitrageBot {
       const simOk = await this.simulate(buyTx);
       if (!simOk) {
         this.log.debug(`${opp.tokenSymbol}: simulation rejected`);
+        this.tracker.recordSimSkip();
+        return;
+      }
+
+      // Simulate SELL before spending on BUY
+      const sellSimOk = await this.simulate(sellTx);
+      if (!sellSimOk) {
+        this.log.debug(`${opp.tokenSymbol}: sell simulation rejected — skipping (honeypot?)`);
         this.tracker.recordSimSkip();
         return;
       }
@@ -690,7 +741,7 @@ class MilkaArbitrageBot {
         if (s?.err) { this.log.debug('On-chain error', s.err); return false; }
         if (s?.confirmationStatus === 'confirmed' || s?.confirmationStatus === 'finalized') return true;
       } catch { /* retry */ }
-      await this.sleep(500);
+      await this.sleep(1500);
     }
 
     this.log.debug(`Confirmation timeout: ${sig.substring(0, 12)}...`);

@@ -21,7 +21,7 @@ const SEEN_PATH      = path.join(__dirname, '../logs/watcher-seen.json');
 const POLL_INTERVAL  = 30_000;
 const MAX_WATCHLIST  = 50;
 const MAX_AGE_MS     = 2 * 60 * 60 * 1000;
-const PUMPFUN_WS     = 'wss://advanced-api.pump.fun/';
+const PUMPFUN_WS     = 'wss://pumpportal.fun/api/data';
 
 function log(msg: string) {
   const ts   = new Date().toISOString();
@@ -86,14 +86,15 @@ function startPumpFunWatcher(seen: Set<string>) {
       log('[pump.fun] ✅ Connected — listening for graduations');
       reconnectDelay = 2_000;
       ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+      ws.send(JSON.stringify({ method: 'subscribeMigration' }));
     });
 
     ws.on('message', (raw: Buffer) => {
       try {
         const msg = JSON.parse(raw.toString());
-        if (msg.txType === 'graduated' || msg.type === 'graduated' || msg.graduatedAt) {
+        if (msg.txType === 'graduated' || msg.type === 'graduated' || msg.graduatedAt || msg.txType === 'migration' || msg.txType === 'migrate') {
           const mint      = msg.mint || msg.tokenAddress || msg.address;
-          const symbol    = msg.symbol || msg.ticker || '???';
+          const symbol    = msg.symbol || msg.ticker || msg.name || mint.slice(0, 8);
           const graduated = msg.graduatedAt || new Date().toISOString();
           if (mint) addToWatchlist(seen, mint, symbol, 'pump.fun', graduated);
         }
